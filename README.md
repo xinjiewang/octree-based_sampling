@@ -4,16 +4,11 @@ This is the code repository for the octree-based sampling optimization. It is pr
 
 The code repository of MeshfreeFlowNet is https://github.com/maxjiang93/space_time_pde.
 
-![overview](pic/overview.jpg)
+### Overview and Sampling Strategy
 
-![sampling](pic/sampling.png)
+![overview](pic/overview_and_octree.png)
 
-
-#### SR result
-
-![](pic/frame_122.png)
-
-#### Convergence Curve
+### Convergence Curve
 
 ![](pic/convergence_curve.png)
 
@@ -33,7 +28,7 @@ conda activate octree
 
 ### Running Examples
 
-#### train
+#### Train
 
 ```
 python train_octree.py --slope_num=NUM --recon_min=NUM --log_dir=PATH --train_data=DATA_NAME
