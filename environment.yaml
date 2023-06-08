@@ -1,0 +1,18 @@
+name: octree
+channels:
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.8
+  - pip=20.3
+  - cudatoolkit=11.3
+  - pytorch=1.12.1
+  - torchvision=0.13.1
+  - numpy=1.23.1
+  - pip:
+    - scipy
+    - scikit-image==0.19.3
+    - tensorboard
+    - matplotlib
+    - sympy
+    - tqdm
