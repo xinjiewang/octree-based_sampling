@@ -4,14 +4,18 @@ This is the code repository for the octree-based sampling optimization. It is pr
 
 The code repository of MeshfreeFlowNet is https://github.com/maxjiang93/space_time_pde.
 
-![overview](pic\overview.jpg)
+![overview](pic/overview.jpg)
 
-![sampling](pic\sampling.png)
+![sampling](pic/sampling.png)
 
 
-#### Demo on convective data
+#### SR result
 
-![](pic\frame_122.png)
+![](pic/frame_122.png)
+
+#### Convergence Curve
+
+![](pic/convergence_curve.png)
 
 ### Dependencies and Installation
 
