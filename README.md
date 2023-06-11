@@ -1,14 +1,16 @@
 # Octree-based hierarchical sampling optimization for the volumetric super-resolution of scientific data
 
-This is the code repository for the octree-based sampling optimization. It is proposed for efficient training of physics-constrained deep learning models. We use MeshfreeFlowNet as the baseline, which is a physical constrained space-time super-resolution framework. 
+[Preprint version of our paper](https://arxiv.org/abs/2306.05133)
 
-The code repository of MeshfreeFlowNet is https://github.com/maxjiang93/space_time_pde.
+This is the code repository of our octree-based sampling optimization. This importance sampling method is proposed for efficient training of physics-constrained deep learning models. We use MeshfreeFlowNet as the baseline, which is a physical constrained space-time super-resolution framework. 
+
+The code repository of MeshfreeFlowNet is [here](https://github.com/maxjiang93/space_time_pde).
 
 ### Overview and Sampling Strategy
 
 ![overview](pic/overview_and_octree.png)
 
-### Convergence Curve
+### Comparison of Convergence Curves
 
 ![](pic/convergence_curve.png)
 
