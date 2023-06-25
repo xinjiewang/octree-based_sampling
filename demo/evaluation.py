@@ -13,36 +13,24 @@ import shutil
 import os
 # import our modules
 import sys
-sys.path.append("../../src")
+sys.path.append("../space_time_pde/src")
 from unet3d import UNet3d
 from implicit_net import ImNet
 from pde import PDELayer
 from nonlinearities import NONLINEARITIES
 from local_implicit_grid import query_local_implicit_grid
+
+sys.path.append("../space_time_pde/experiments/rb2d")
 import dataloader_spacetime as loader
 from physics import get_rb2_pde_layer
 from torch_flow_stats import *
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 
-eval_tres=192 # 与unet网络结构有关，保证低分辨输入数据在特征提取过程中在时间维度上保持正确
-eval_xres=512
-eval_zres=128
-eval_downsamp_t=4 # 192->48->12
-eval_downsamp_xz=8
-# ckpt='./log/treshold/aim10/epoch10/checkpoint_latest.pth.tar_pdenet_best.pth.tar'
-ckpt='./log/treshold_64/aim4/epoch30/checkpoint_latest.pth.tar_pdenet_best.pth.tar'
-save_path='./eval/tresh/rb2d_ra1e6_s42'
-eval_dataset='rb2d_ra1e6_s42.npz'
-frame_rate=10
-eval_pseudo_batch_size=2000
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 rayleigh=1000000.0
 prandtl=1.
-keep_frames=True
 
-# os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-# torch.cuda.set_device(0)
 def evaluate_feat_grid(pde_layer, latent_grid, t_seq, z_seq, x_seq, mins, maxs, pseudo_batch_size):
     """Evaluate latent feature grid at fixed intervals.
 
@@ -102,7 +90,7 @@ def frames_to_video(frames_pattern, save_video_to, frame_rate=10, keep_frames=Fa
     keep_frames: bool, whether to keep frames after generating video.
     """
     cmd = ("ffmpeg -framerate {frame_rate} -pattern_type glob -i '{frames_pattern}' "
-           "-c:v libx264 -r 30 -pix_fmt yuv420p {save_video_to}" # -framerate意思是采用给定帧率来生成输入的图像序列文件的时间戳；-r意思是通过重复帧或者丢弃帧来实现给定的帧率。这里是首先按照10FPS生成输入图像序列文件的时间戳，然后每张图像重复3次生成输出视频文件实现30FPS。
+           "-c:v libx265 -r 30 -pix_fmt yuv420p {save_video_to}"
            .format(frame_rate=frame_rate, frames_pattern=frames_pattern,
                    save_video_to=save_video_to))
     os.system(cmd)
@@ -114,7 +102,7 @@ def frames_to_video(frames_pattern, save_video_to, frame_rate=10, keep_frames=Fa
         shutil.rmtree(frames_dir)
 
 
-def calculate_flow_stats(pred, hres, args, visc=0.0001):
+def calculate_flow_stats(pred, hres, visc=0.0001):
     data = pred
     uw = np.transpose(data[2:4,:,:,1:1+args.eval_zres], (1, 0, 2, 3))
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -122,9 +110,7 @@ def calculate_flow_stats(pred, hres, args, visc=0.0001):
     stats = compute_all_stats(uw[2:,:,:,:], viscosity=visc, description=False)
     s = [stats[..., i].item() for i in range(stats.shape[0])]
 
-    # file = open("REPORT___FlowStats_Pred_vs_GroundTruth.txt", "w")
-
-    file = open(os.path.join(args.save_path, "REPORT___FlowStats_Pred_vs_GroundTruth.txt"), "w")
+    file = open("REPORT___FlowStats_Pred_vs_GroundTruth.txt", "w")
 
     file.write("***** Pred Data Flow Statistics ******\n")
     file.write("Total Kinetic Energy     : {}\n".format(s[0]))
@@ -165,10 +151,10 @@ def export_video(args, res_dict, hres, lres, dataset):
         lres = dataset.denormalize_grid(lres.copy())
         pred = np.stack([res_dict[key] for key in phys_channels], axis=0)
         pred = dataset.denormalize_grid(pred)
-        # calculate_flow_stats(pred, hres, args)       # Warning: only works with pytorch > v1.3 and CUDA >= v10.1
+        #calculate_flow_stats(pred, hres)       # Warning: only works with pytorch > v1.3 and CUDA >= v10.1
         # np.savez_compressed(args.save_path+'highres_lowres_pred', hres=lres, lres=lres, pred=pred)
 
-
+    os.makedirs(args.save_path, exist_ok=True)
     # enumerate through physical channels first
 
     for idx, name in enumerate(phys_channels):
@@ -184,6 +170,7 @@ def export_video(args, res_dict, hres, lres, dataset):
         file = open(os.path.join(args.save_path, "REPORT___FlowStats_Pred_vs_GroundTruth.txt"), "a")
         file.write("SSIM_{}    : {}\n".format(name,ssim_total))
         file.write("PSNR_{}    : {}\n".format(name,psnr_total))
+
         # loop over each timestep in pred_frames
         max_val = np.max(hres_frames)
         min_val = np.min(hres_frames)
@@ -244,7 +231,7 @@ def model_inference(args, lres, pde_layer):
     imnet.eval()
     all_model_params = list(unet.parameters())+list(imnet.parameters())
 
-    # evaluate 得到可插值的隐式时空特征网格
+    # evaluate
     latent_grid = unet(torch.tensor(lres, dtype=torch.float32)[None].to(device))
     latent_grid = latent_grid.permute(0, 2, 3, 4, 1)  # [batch, T, Z, X, C]
 
@@ -278,38 +265,36 @@ def model_inference(args, lres, pde_layer):
 def get_args():
     # Training settings
     parser = argparse.ArgumentParser(description="Segmentation")
-    parser.add_argument("--eval_xres", type=int, default=eval_xres, metavar="X",
+    parser.add_argument("--eval_xres", type=int, default=512, metavar="X",
                         help="x resolution during evaluation (default: 512)")
-    parser.add_argument("--eval_zres", type=int, default=eval_zres, metavar="Z",
+    parser.add_argument("--eval_zres", type=int, default=128, metavar="Z",
                         help="z resolution during evaluation (default: 128)")
-    parser.add_argument("--eval_tres", type=int, default=eval_tres, metavar="T",
+    parser.add_argument("--eval_tres", type=int, default=192, metavar="T",
                         help="t resolution during evaluation (default: 192)")
-    parser.add_argument("--eval_downsamp_t", default=eval_downsamp_t, type=int, 
+    parser.add_argument("--eval_downsamp_t", default=4, type=int,
                         help="down sampling factor in t for low resolution crop.")
-    parser.add_argument("--eval_downsamp_xz", default=eval_downsamp_xz, type=int,
+    parser.add_argument("--eval_downsamp_xz", default=8, type=int,
                         help="down sampling factor in x and z for low resolution crop.")
-    parser.add_argument('--ckpt', type=str, default=ckpt, help="path to checkpoint")
-    parser.add_argument("--save_path", type=str, default=save_path)
-    parser.add_argument("--data_folder", type=str, default="./data",
-                        help="path to data folder (default: ./data)")
-    parser.add_argument("--eval_dataset", type=str, default=eval_dataset)
+    parser.add_argument('--ckpt', type=str, required=True, help="path to checkpoint")
+    parser.add_argument("--save_path", type=str, default='eval')
+    parser.add_argument("--eval_dataset", type=str, required=True)
     parser.add_argument("--lres_interp", type=str, default='linear',
                         help="str, interpolation scheme for generating low res. choices of 'linear', 'nearest'")
     parser.add_argument("--lres_filter", type=str, default='none',
                         help=" str, filter to apply on original high-res image before \
                         interpolation. choices of 'none', 'gaussian', 'uniform', 'median', 'maximum'")
-    parser.add_argument("--frame_rate", type=int, default=frame_rate, metavar="N",
+    parser.add_argument("--frame_rate", type=int, default=10, metavar="N",
                         help="frame rate for output video (default: 10)")
     parser.add_argument("--keep_frames", dest='keep_frames', action='store_true')
     parser.add_argument("--no_keep_frames", dest='keep_frames', action='store_false')
-    parser.add_argument("--eval_pseudo_batch_size", type=int, default=eval_pseudo_batch_size,
+    parser.add_argument("--eval_pseudo_batch_size", type=int, default=10000,
                         help="psudo batch size for querying the grid. set to a smaller"
                              " value if OOM error occurs")
-    parser.add_argument('--rayleigh', type=float, default=rayleigh,
+    parser.add_argument('--rayleigh',type=float, default=rayleigh,
                         help='Simulation Rayleigh number.')
     parser.add_argument('--prandtl', type=float, default=prandtl,
                         help='Simulation Prandtl number.')
-    parser.set_defaults(keep_frames=keep_frames)
+    parser.set_defaults(keep_frames=True)
     args = parser.parse_args()
     return args
 
@@ -317,7 +302,6 @@ def get_args():
 def main():
     args = get_args()
     param_file = os.path.join(os.path.dirname(args.ckpt), "params.json")
-    os.makedirs(args.save_path, exist_ok=True)
     with open(param_file, 'r') as fh:
         args.__dict__.update(json.load(fh))
 

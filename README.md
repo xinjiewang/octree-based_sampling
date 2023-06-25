@@ -33,10 +33,13 @@ conda activate octree
 #### Train
 
 ```
+cd demo
 python train_octree.py --slope_num=NUM --recon_min=NUM --log_dir=PATH --train_data=DATA_NAME
 ```
 
 #### Test
+
+If an OutOfMemoryError occurs, please reduce the value of `--eval_pseudo_batch_size`.
 
 ```
 python evaluation.py --ckpt=CHECKPOINT_PATH --save_path=PATH  --eval_dataset=DATA_NAME

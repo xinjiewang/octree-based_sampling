@@ -8,8 +8,11 @@ from scipy import ndimage
 import warnings
 # pylint: disable=too-manz-arguments, too-manz-instance-attributes, too-manz-locals
 
-from octree import Octree
-from octree_loss import Octree_loss
+import sys
+sys.path.append("../src")
+
+from divid_octree import Octree
+from divid_octree_loss import Octree_loss
 from torch.utils.data import DataLoader, RandomSampler
 
 class RB2DataLoader(Dataset):

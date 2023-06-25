@@ -6,43 +6,50 @@ import os
 from glob import glob
 import numpy as np
 from collections import defaultdict
+
 np.set_printoptions(precision=4)
 
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.nn as nn
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.tensorboard import SummaryWriter
 
 # import our modules
 import sys
-sys.path.append("../../src")
+import dataloader_spacetime_octree as loader
+
+sys.path.append("../space_time_pde/src")
 import train_utils as utils
 from unet3d import UNet3d
 from implicit_net import ImNet
 from local_implicit_grid import query_local_implicit_grid
 from nonlinearities import NONLINEARITIES
-import dataloader_spacetime as loader
+
+sys.path.append("../space_time_pde/experiments/rb2d")
 from physics import get_rb2_pde_layer
 import time
-# from thop import profile
 
+sys.path.append("../src")
+from divid_octree_loss import Octree_loss
+from scipy.stats import linregress
 # pylint: disable=no-member
 
 # Rayleigh and Prandtl numbers - set according to your dataset
-rayleigh=1000000
-prandtl=1
-gamma=0.0125
-use_continuity=True
-log_dir_name="./log/Exp_ori_512"
+rayleigh = 1000000
+prandtl = 1
+gamma = 0.0125
+use_continuity = True
+log_dir_name = "../space_time_pde/experiments/rb2d/log/1/"
 
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 # torch.cuda.set_device(0)
 
 
 total_num_sample_points = 0
+
 
 def loss_functional(loss_type):
     """Get loss function given function type names."""
@@ -53,6 +60,14 @@ def loss_functional(loss_type):
     # else (loss_type == 'huber')
     return F.smooth_l1_loss
 
+#vector padding
+def padding(point,max_size):
+    # point = np.pad(point, ((0,max_size-len(point)),(0,0)), 'constant')
+    point = torch.tensor(point)
+    if len(point) < max_size:
+        point = F.pad(point, (0,0,0,max_size-len(point)), 'constant')
+    point = point.unsqueeze(0)
+    return point
 
 def train(args, unet, imnet, train_loader, epoch, global_step, device,
           logger, writer, optimizer, pde_layer):
@@ -67,9 +82,22 @@ def train(args, unet, imnet, train_loader, epoch, global_step, device,
     loss_func = loss_functional(args.reg_loss_type)
     for batch_idx, data_tensors in enumerate(train_loader):
         # send tensors to device
-        
-        data_tensors = [t.to(device) for t in data_tensors]
+
+        # data_tensors = [t.to(device) for t in data_tensors]
         input_grid, point_coord, point_value = data_tensors
+        input_grid = torch.from_numpy(input_grid).to(device)
+
+        # Expanding with zero padding in numpy and combining into a tensor
+        max_size = max(len(i) for i in point_coord)
+        per_len = [len(i) for i in point_coord]
+
+        point_coord_new_list = [padding(point,max_size) for point in point_coord]
+        point_value_new_list = [padding(value,max_size) for value in point_value]
+
+        #tensor concat
+        point_coord_new = torch.cat(point_coord_new_list,0).to(device)
+        point_value_new = torch.cat(point_value_new_list,0).to(device)
+
         optimizer.zero_grad()
         latent_grid = unet(input_grid)  # [batch, N, C, T, X, Y]
         # permute such that C is the last channel for local implicit grid query
@@ -80,17 +108,20 @@ def train(args, unet, imnet, train_loader, epoch, global_step, device,
 
         # update pde layer and compute predicted values + pde residues
         pde_layer.update_forward_method(fwd_fn)
-        pred_value, residue_dict = pde_layer(point_coord, return_residue=True)
+        pred_value, residue_dict = pde_layer(point_coord_new, return_residue=True)
+
+        #Restore pred_value and reset all dimensions that exceed it to 0.
+        for i in range(point_coord_new.shape[0]):
+            if per_len[i] < max_size:
+                pred_value[i,per_len[i]:max_size,:] = 0
 
         # function value regression loss
-        reg_loss = loss_func(pred_value, point_value)
-        # print("compute reg_loss using torch.abs() and torch.mean(): ", point_value.requires_grad)
+        reg_loss = loss_func(pred_value, point_value_new)
 
         # pde residue loss
         pde_tensors = torch.stack([d for d in residue_dict.values()], dim=0)
         zero_pde_tensors = torch.zeros_like(pde_tensors)
         pde_loss = loss_func(pde_tensors, zero_pde_tensors)
-        # print("compute pde_loss using torch.abs() and torch.mean(): ", zero_pde_tensors.requires_grad)
         loss = args.alpha_reg * reg_loss + args.alpha_pde * pde_loss
 
         loss.backward()
@@ -103,8 +134,10 @@ def train(args, unet, imnet, train_loader, epoch, global_step, device,
         tot_loss += loss.item()
         # count += input_grid.size()[0]
         count += 1
-        total_num_sample_points += args.n_samp_pts_per_crop * args.batch_size
-        if (batch_idx+1) % args.log_interval == 0:
+        for i in per_len:
+            if i > 2:
+                total_num_sample_points += i
+        if (batch_idx + 1) % args.log_interval == 0:
             # print('shape of pred_value per batch (b, n, c): ', list(pred_value.shape))
             # print('shape of pde_tensors per batch (b, n, c): ', list(pde_tensors.shape))
             # print("so far, the total number of sample points in this training is: ", total_num_sample_points)
@@ -113,32 +146,29 @@ def train(args, unet, imnet, train_loader, epoch, global_step, device,
             logger.info(
                 "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss Sum: {:.6f}\t"
                 "Loss Reg: {:.6f}\tLoss Pde: {:.6f}".format(
-                    epoch, (batch_idx+1) * len(input_grid), len(train_loader) * len(input_grid),
-                    100. * (batch_idx+1) / len(train_loader), loss.item(),
-                    args.alpha_reg * reg_loss, args.alpha_pde * pde_loss))
+                    epoch, (batch_idx + 1) * len(input_grid), len(train_loader) * len(input_grid),
+                           100. * (batch_idx + 1) / len(train_loader), loss.item(),
+                           args.alpha_reg * reg_loss, args.alpha_pde * pde_loss))
             # tensorboard log
-            writer.add_scalar('train/reg_loss_unweighted', reg_loss, global_step=int(global_step))
-            writer.add_scalar('train/pde_loss_unweighted', pde_loss, global_step=int(global_step))
-            writer.add_scalar('train/sum_loss', loss, global_step=int(global_step))
+            writer.add_scalar('train/reg_loss_unweighted', reg_loss, global_step=int(epoch))
+            writer.add_scalar('train/pde_loss_unweighted', pde_loss, global_step=int(epoch))
+            writer.add_scalar('train/sum_loss', loss, global_step=int(epoch))
             writer.add_scalars('train/losses_weighted',
                                {"reg_loss": args.alpha_reg * reg_loss,
                                 "pde_loss": args.alpha_pde * pde_loss,
-                                "sum_loss": loss}, global_step=int(global_step))
+                                "sum_loss": loss}, global_step=int(epoch))
 
         global_step += 1
-    # print(count)
     tot_loss /= count
     return tot_loss
 
 
-def eval(args, unet, imnet, eval_loader, epoch, global_step2, device,
-         logger, writer, optimizer, pde_layer,loss):
+def eval(args, unet, imnet, eval_loader, epoch, global_step, device,
+         logger, writer, optimizer, pde_layer):
     """Eval function. Used for evaluating entire slices and comparing to GT."""
     unet.eval()
     imnet.eval()
-    loss_func = loss_functional(args.reg_loss_type)
     phys_channels = ["p", "b", "u", "w"]
-    pde_channels = ['transport_eqn_b','transport_eqn_u','transport_eqn_w','continuity']
     phys2id = dict(zip(phys_channels, range(len(phys_channels))))
     xmin = torch.zeros(3, dtype=torch.float32).to(device)
     xmax = torch.ones(3, dtype=torch.float32).to(device)
@@ -147,9 +177,13 @@ def eval(args, unet, imnet, eval_loader, epoch, global_step2, device,
         break
     # send tensors to device
     data_tensors = [t.to(device) for t in data_tensors]
-    hres_grid, lres_grid, _, _ = data_tensors
+    hres_grid, lres_grid = data_tensors
     latent_grid = unet(lres_grid)  # [batch, C, T, Z, X]
+    # nb, nc, nt, nz, nx = lres_grid.shape
     nb, nc, nt, nz, nx = hres_grid.shape
+    #scale index
+    index = args.scale
+    nt, nz, nx = int(nt/index), int(nz/index), int(nx/index)
 
     # permute such that C is the last channel for local implicit grid query
     latent_grid = latent_grid.permute(0, 2, 3, 4, 1)  # [batch, T, Z, X, C]
@@ -162,76 +196,45 @@ def eval(args, unet, imnet, eval_loader, epoch, global_step2, device,
 
     # layout query points for the desired slices
     eps = 1e-6
-    t_seq = torch.linspace(eps, 1-eps, nt)[::int(nt/8)]  # temporal sequences
-    z_seq = torch.linspace(eps, 1-eps, nz)  # z sequences
-    x_seq = torch.linspace(eps, 1-eps, nx)  # x sequences
-
+    t_seq = torch.linspace(eps, 1 - eps, nt)  # temporal sequences
+    z_seq = torch.linspace(eps, 1 - eps, nz)  # z sequences
+    x_seq = torch.linspace(eps, 1 - eps, nx)  # x sequences
     query_coord = torch.stack(torch.meshgrid(t_seq, z_seq, x_seq), axis=-1)  # [nt, nz, nx, 3]
     query_coord = query_coord.reshape([-1, 3]).to(device)  # [nt*nz*nx, 3]
     n_query = query_coord.shape[0]
 
     res_dict = defaultdict(list)
-
-    n_iters = int(np.ceil(n_query/args.pseudo_batch_size))
+    n_iters = int(np.ceil(n_query / args.pseudo_batch_size))        #48
 
     for idx in range(n_iters):
         sid = idx * args.pseudo_batch_size
-        eid = min(sid+args.pseudo_batch_size, n_query)
+        eid = min(sid + args.pseudo_batch_size, n_query)
         query_coord_batch = query_coord[sid:eid]
-        query_coord_batch = query_coord_batch[None].expand(*(nb, eid-sid, 3))  # [nb, eid-sid, 3]
-
+        query_coord_batch = query_coord_batch[None].expand(*(nb, eid - sid, 3))  # [nb, eid-sid, 3]
         pred_value, residue_dict = pde_layer(query_coord_batch, return_residue=True)
         pred_value = pred_value.detach()
+
         for key in residue_dict.keys():
             residue_dict[key] = residue_dict[key].detach()
         for name, chan_id in zip(phys_channels, range(4)):
             res_dict[name].append(pred_value[..., chan_id])  # [b, pb]
         for name, val in residue_dict.items():
-            res_dict[name].append(val[..., 0])   # [b, pb]
+            res_dict[name].append(val[..., 0])  # [b, pb]
 
     for key in res_dict.keys():
         res_dict[key] = (torch.cat(res_dict[key], axis=1)
                          .reshape([nb, len(t_seq), len(z_seq), len(x_seq)]))
 
-    ground_truth = hres_grid[:,:,::int(nt/8)]
-    # res_value = torch.stack([res_dict['p'],res_dict['b'],res_dict['u'],res_dict['w']],dim=1)
-    # pde_tensors = torch.stack([res_dict['transport_eqn_b'],res_dict['transport_eqn_u'],res_dict['transport_eqn_w'],res_dict['continuity']],dim=1)
-    # zero_pde_tensors = torch.zeros_like(pde_tensors)
-    # reg_loss = loss_func(res_value,ground_truth)
-    # pde_loss = loss_func(pde_tensors,zero_pde_tensors)
-    # loss = (args.alpha_reg * reg_loss + args.alpha_pde * pde_loss)/nb
+    # constructing loss distribution
+    gt_value = hres_grid[0, :, ::index, ::index, ::index]
+    res_value = torch.cat([res_dict['p'],res_dict['b'],res_dict['u'],res_dict['w']],axis =0)
+    loss_abs = torch.abs(res_value - gt_value)
+    loss_std = torch.std(loss_abs, axis=(1, 2, 3))
+    if args.div_method == "mean":
+        loss_std = torch.mean(loss_abs, axis=(1, 2, 3))
 
-    # # log the imgs sample-by-sample
-    for samp_id in range(nb):
-        reg_loss2 = 0
-        pde_loss2 = 0
-        for key in res_dict.keys():
-            field = res_dict[key][samp_id]  # [nt, nz, nx]
-            # add predicted slices
-            # images = utils.batch_colorize_scalar_tensors(field)  # [nt, nz, nx, 3]
-            #
-            # writer.add_images('sample_{}/{}/predicted'.format(samp_id, key), images,
-            #     dataformats='NHWC', global_step=int(global_step))
-            # add ground truth slices (only for phys channels)
-            if key in phys_channels:
-                gt_fields = hres_grid[samp_id, phys2id[key], ::int(nt/8)]  # [nt, nz, nx]
-                # gt_images = utils.batch_colorize_scalar_tensors(gt_fields)  # [nt, nz, nx, 3]
-
-                # writer.add_images('sample_{}/{}/ground_truth'.format(samp_id, key), gt_images,
-                #     dataformats='NHWC', global_step=int(global_step))
-                reg_loss2 += loss_func(field,gt_fields)
-            if key in pde_channels:
-                zero_pde_tensors2 = torch.zeros_like(field)
-                pde_loss2 += loss_func(field, zero_pde_tensors2)
-        eval_loss = (args.alpha_reg * reg_loss2/4 + args.alpha_pde * pde_loss2/4)/50 +loss
-        writer.add_scalar('eval/sum_loss', eval_loss, global_step=int(global_step2))
-        writer.add_scalars('eval/losses_weighted',
-                           {"reg_loss": args.alpha_reg * reg_loss2,
-                            "pde_loss": args.alpha_pde * pde_loss2,
-                            "sum_loss": eval_loss}, global_step=int(global_step2))
-        global_step2 += 40
-
-    return 1
+    #create new tree
+    Octree_loss(args.data_folder, args.train_data,loss=loss_abs, loss_std=loss_std)
 
 def get_args():
     def str2bool(v):
@@ -246,6 +249,11 @@ def get_args():
 
     # Training settings
     parser = argparse.ArgumentParser(description="Segmentation")
+    parser.add_argument("--slope_num", type=int,default=10, help="compute loss numbers(default: 10).")
+    parser.add_argument("--recon_min", type=int, default=10,help="minimum reconstruction interval(default: 10)")
+    parser.add_argument("--slope_treshold", type=int, default=0,help="the slope treshold of the loss.(default: 0)")
+    parser.add_argument("--scale", type=int, default=2,help="scale_index")
+    parser.add_argument("--div_method", type=str, default="std", choices=["mean", "std"],help="divide tree by mean(std).(default:std)")
     parser.add_argument("--batch_size_per_gpu", type=int, default=10, metavar="N",
                         help="input batch size for training (default: 10)")
     parser.add_argument("--epochs", type=int, default=100, metavar="N",
@@ -258,7 +266,7 @@ def get_args():
                         help="disables CUDA training")
     parser.add_argument("--seed", type=int, default=1, metavar="S",
                         help="random seed (default: 1)")
-    parser.add_argument("--data_folder", type=str, default="./data",
+    parser.add_argument("--data_folder", type=str, default="../space_time_pde/experiments/rb2d/data",
                         help="path to data folder (default: ./data)")
     parser.add_argument("--train_data", type=str, default="rb2d_ra1e6_s102.npz",
                         help="name of training data (default: rb2d_ra1e6_s102.npz)")
@@ -266,7 +274,7 @@ def get_args():
                         help="name of training data (default: rb2d_ra1e6_s42.npz)")
     parser.add_argument("--log_interval", type=int, default=10, metavar="N",
                         help="how many batches to wait before logging training status")
-    parser.add_argument("--log_dir", type=str,  default=log_dir_name, help="log directory for run")
+    parser.add_argument("--log_dir", type=str,default=log_dir_name ,help="log directory for run")
     parser.add_argument("--optim", type=str, default="adam", choices=["adam", "sgd"])
     parser.add_argument("--resume", type=str, default=None,
                         help="path to checkpoint if resume is needed")
@@ -322,8 +330,8 @@ def get_args():
 
 
 def main():
+    start = time.perf_counter()  # count time
 
-    start = time.perf_counter()
     args = get_args()
 
     use_cuda = (not args.no_cuda) and torch.cuda.is_available()
@@ -331,8 +339,8 @@ def main():
     device = torch.device("cuda" if use_cuda else "cpu")
     # adjust batch size based on the number of gpus available
     args.batch_size = int(torch.cuda.device_count()) * args.batch_size_per_gpu
+    # log_dir = "./log/aim{}/min_epoch{}".format(args.slope_num,args.aim_epoch)
 
-    # log and create snapshots
     os.makedirs(args.log_dir, exist_ok=True)
     filenames_to_snapshot = glob("*.py") + glob("*.sh")
     utils.snapshot_files(filenames_to_snapshot, args.log_dir)
@@ -354,34 +362,29 @@ def main():
         nx=args.nx, nz=args.nz, nt=args.nt, n_samp_pts_per_crop=args.n_samp_pts_per_crop,
         downsamp_xz=args.downsamp_xz, downsamp_t=args.downsamp_t,
         normalize_output=args.normalize_channels, return_hres=False,
-        lres_filter=args.lres_filter, lres_interp=args.lres_interp
+        lres_filter=args.lres_filter, lres_interp=args.lres_interp,div_method = args.div_method
     )
+
     evalset = loader.RB2DataLoader(
-        data_dir=args.data_folder, data_filename=args.eval_data,
-        nx=args.nx, nz=args.nz, nt=args.nt, n_samp_pts_per_crop=args.n_samp_pts_per_crop,
+        data_dir=args.data_folder, data_filename=args.train_data,
+        nx=512, nz=128, nt=192, n_samp_pts_per_crop=args.n_samp_pts_per_crop,
         downsamp_xz=args.downsamp_xz, downsamp_t=args.downsamp_t,
         normalize_output=args.normalize_channels, return_hres=True,
         lres_filter=args.lres_filter, lres_interp=args.lres_interp
     )
 
     train_sampler = RandomSampler(trainset, replacement=True, num_samples=args.pseudo_epoch_size)
-    eval_sampler = RandomSampler(evalset, replacement=True, num_samples=5)
 
     train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, drop_last=True,
-                              sampler=train_sampler, **kwargs)
-    eval_loader = DataLoader(evalset, batch_size=args.batch_size, shuffle=False, drop_last=False,
-                             sampler=eval_sampler, **kwargs)
+                              sampler=train_sampler, collate_fn=loader.pad_num_pts, **kwargs)
+    eval_loader = DataLoader(evalset, batch_size=1, shuffle=False, drop_last=False, **kwargs)
 
     # setup model
     unet = UNet3d(in_features=4, out_features=args.lat_dims, igres=trainset.scale_lres,
                   nf=args.unet_nf, mf=args.unet_mf)
-    # input = torch.randn(1, 4, 4, 16, 16)
-    # flops, params = profile(unet, inputs=(input, ))
-    imnet = ImNet(dim=3, in_features=args.lat_dims, out_features=4, nf=args.imnet_nf, 
+    imnet = ImNet(dim=3, in_features=args.lat_dims, out_features=4, nf=args.imnet_nf,
                   activation=NONLINEARITIES[args.nonlin])
-    # input2 = torch.randn(176,35)
-    # flops2, params2 = profile(imnet, inputs=(input2,))
-    all_model_params = list(unet.parameters())+list(imnet.parameters())
+    all_model_params = list(unet.parameters()) + list(imnet.parameters())
 
     if args.optim == "sgd":
         optimizer = optim.SGD(all_model_params, lr=args.lr)
@@ -390,7 +393,6 @@ def main():
 
     start_ep = 0
     global_step = np.zeros(1, dtype=np.uint32)
-    global_step2 = np.zeros(1, dtype=np.uint32)
     tracked_stats = np.inf
 
     if args.resume:
@@ -424,21 +426,53 @@ def main():
     else:
         mean = std = None
     pde_layer = get_rb2_pde_layer(mean=mean, std=std,
-        t_crop=args.nt*0.125, z_crop=args.nz*(1./128), x_crop=args.nx*(1./128), prandtl=args.prandtl, rayleigh=args.rayleigh,
-        use_continuity=args.use_continuity)
+                                  t_crop=args.nt * 0.125, z_crop=args.nz * (1. / 128), x_crop=args.nx * (1. / 128),
+                                  prandtl=args.prandtl, rayleigh=args.rayleigh,
+                                  use_continuity=args.use_continuity)
 
     if args.lr_scheduler:
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+
+    #saving loss list
     loss_info = []
+    tmp_epoch = -args.recon_min
+    x = [i for i in range(args.slope_num)]
+
     # training loop
     for epoch in range(start_ep + 1, args.epochs + 1):
         loss = train(args, unet, imnet, train_loader, epoch, global_step, device, logger, writer,
                      optimizer, pde_layer)
+
+        #rebuild loss tree
         loss_info.append(loss)
-        # eval_loss = eval(args, unet, imnet, eval_loader, epoch, global_step2, device, logger, writer, optimizer,
-        #     pde_layer,loss)
-        # with open(os.path.join(args.log_dir, "loss_data.txt"), 'a') as f:
-        #     f.write("Epoch: {}\nLoss:{}\nEval:{}\n".format(epoch,loss,eval_loss))
+        slope = -10
+        if len(loss_info) >=args.slope_num:
+            y = loss_info[-args.slope_num:]
+            slope, intercept, r_value, p_value, std_err = linregress(x, y)
+        if slope >= args.slope_treshold and epoch-tmp_epoch>=args.recon_min:
+            tmp_epoch = epoch
+            octree_name = os.path.join(args.data_folder, args.train_data + '.octree_loss.pkl')
+            leaves_name = os.path.join(args.data_folder, args.train_data + '.leaves_loss.pkl')
+            if os.path.exists(octree_name):
+                os.remove(octree_name)
+                os.remove(leaves_name)
+            logger.info("create new octree_loss")
+            eval(args, unet, imnet, eval_loader, epoch, global_step, device, logger, writer, optimizer,
+            pde_layer)
+
+            #create new dataloader by loss tree
+            trainset = loader.RB2DataLoader(
+                data_dir=args.data_folder, data_filename=args.train_data,
+                nx=args.nx, nz=args.nz, nt=args.nt, n_samp_pts_per_crop=args.n_samp_pts_per_crop,
+                downsamp_xz=args.downsamp_xz, downsamp_t=args.downsamp_t,
+                normalize_output=args.normalize_channels, return_hres=False,
+                lres_filter=args.lres_filter, lres_interp=args.lres_interp,
+                loss_tree=True
+            )
+            train_sampler = RandomSampler(trainset, replacement=True, num_samples=args.pseudo_epoch_size)
+            train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, drop_last=True,
+                                      sampler=train_sampler, collate_fn=loader.pad_num_pts, **kwargs)
+
         if args.lr_scheduler:
             scheduler.step(loss)
         if loss < tracked_stats:
@@ -456,8 +490,8 @@ def main():
             "global_step": global_step,
         }, is_best, epoch, checkpoint_path, "_pdenet", logger)
 
-    # print("The total number of sample points in this training is: ", total_num_sample_points)
     end = time.perf_counter()
+    logger.info("The best loss in this training is: %d", tracked_stats)
     logger.info("The total number of sample points in this training is: %d", total_num_sample_points)
     logger.info("Total time = %d second", round(end - start))
     with open(args.log_dir+"/loss.txt", "w") as f:
