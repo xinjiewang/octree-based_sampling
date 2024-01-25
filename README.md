@@ -2,6 +2,8 @@
 
 [Preprint version of our paper](https://arxiv.org/abs/2306.05133)
 
+Our paper has been accepted for publication in Journal of Computational Physics.
+
 This is the code repository of our octree-based sampling optimization. This importance sampling method is proposed for efficient training of physics-constrained deep learning models. We use MeshfreeFlowNet as the baseline, which is a physical constrained space-time super-resolution framework. 
 
 The code repository of MeshfreeFlowNet is [here](https://github.com/maxjiang93/space_time_pde).
