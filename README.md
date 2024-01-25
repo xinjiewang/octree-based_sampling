@@ -1,8 +1,11 @@
 # Octree-based hierarchical sampling optimization for the volumetric super-resolution of scientific data
 
-[Preprint version of our paper](https://arxiv.org/abs/2306.05133)
+### Update 2024/01/23: 
+**Our paper has been accepted for publication in Journal of Computational Physics.**
 
-Our paper has been accepted for publication in Journal of Computational Physics.
+---
+
+[Preprint version of our paper](https://arxiv.org/abs/2306.05133)
 
 This is the code repository of our octree-based sampling optimization. This importance sampling method is proposed for efficient training of physics-constrained deep learning models. We use MeshfreeFlowNet as the baseline, which is a physical constrained space-time super-resolution framework. 
 
